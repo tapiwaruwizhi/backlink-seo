@@ -38,3 +38,56 @@ export async function extractDomainsFromPrompt(prompt) {
     return [];
   }
 }
+
+export async function extractMoreDomainsFromPrompt({
+  prompt,
+  previousDomains = [],
+}) {
+  try {
+    const exclusionNote = previousDomains.length
+      ? `\nExclude these domains:\n${previousDomains.join("\n")}`
+      : "";
+
+    const userMessage = {
+      role: "user",
+      content:
+        prompt +
+        exclusionNote +
+        "\n\nReturn only a list of new, real domain names (one per line), no descriptions or explanations.",
+    };
+
+    const messages = [...conversationHistory, userMessage];
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages,
+      max_tokens: 400,
+    });
+
+    const content = response.choices[0].message.content.trim();
+    const lines = content.split("\n");
+
+    const newDomains = lines
+      .map((line) => {
+        const match = line.match(
+          /(?:https?:\/\/)?(?:www\.)?([a-zA-Z0-9.-]+\.[a-z]{2,})/
+        );
+        return match ? match[1].toLowerCase() : null;
+      })
+      .filter(
+        (domain) =>
+          domain &&
+          !previousDomains.includes(domain) // avoid duplicates
+      );
+
+    return {
+      newDomains,
+    };
+  } catch (err) {
+    console.error("GPT domain extraction failed:", err);
+    return {
+      newDomains: [],
+    };
+  }
+}
+

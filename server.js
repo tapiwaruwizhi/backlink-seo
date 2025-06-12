@@ -8,21 +8,23 @@ import { getDomainFromUrl } from "./utils/getDomainFromUrl.js";
 import { checkSafeBrowsing } from "./utils/checkSafeBrowsing.js";
 import { checkTransparencyReport } from "./utils/checkTransparencyReport.js";
 import { isVerifiedDomain } from "./utils/verifyDomain.js";
-import { fetchLinkedInContactsFromDomains } from "./utils/linkedInscrapper.js";
+import {
+  fetchLinkedInContactsFromDomains,
+  storeLinkedInContacts,
+} from "./utils/linkedInscrapper.js";
 import { extractDomainsFromPrompt } from "./utils/chatGPTAnalysis.js";
 import { db } from "./utils/db.js";
+import { crawlPageForEmails } from "./utils/urlScrapper.js";
 
 const app = express();
 app.use(
   cors({
-    origin:"*",
+    origin: "*",
     // origin: "http://localhost:3001", // your React frontend URL
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type"],
   })
 );
-
-
 
 app.use(express.json());
 
@@ -124,8 +126,6 @@ async function analyzeUrl(url) {
   const verified = await isVerifiedDomain(domain);
   const trustLevel = classifyTrust(score, verified);
 
-  //   const LinkedInContacts = fetchLinkedInContactsFromDomains(domain)
-
   return {
     url,
     reason,
@@ -135,7 +135,6 @@ async function analyzeUrl(url) {
     score: Math.max(0, score),
     ...verified,
     trust_level: trustLevel,
-    // linked_in: LinkedInContacts,
   };
 }
 
@@ -160,8 +159,44 @@ app.post("/analyze", async (req, res) => {
   res.json({ results });
 });
 
+app.post("/chatgpt-analyze-only", async (req, res) => {
+  const { prompt, client, user, niche } = req.body;
+
+  if (!prompt || typeof prompt !== "string") {
+    return res.status(400).json({ error: "'prompt' must be a string" });
+  }
+  try {
+    const domains = await extractDomainsFromPrompt(prompt);
+
+    if (!domains.length) {
+      return res
+        .status(404)
+        .json({ error: "No domains could be extracted from the prompt." });
+    }
+    //
+    const results = [];
+    for (const domain of domains) {
+      try {
+        const result = await analyzeUrl(`https://${domain}`);
+        // result.linked_in = linkedInContacts;
+        results.push(result);
+      } catch (e) {
+        results.push({
+          url: domain,
+          error: e.message || "Error analyzing domain",
+        });
+      }
+    }
+
+    res.json({ extracted_domains: domains, results });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to analyze domains from prompt" });
+  }
+});
+
 app.post("/chatgpt-analyze", async (req, res) => {
-  const {  prompt, client, user, niche } = req.body;
+  const { prompt, client, user, niche } = req.body;
 
   if (!prompt || typeof prompt !== "string") {
     return res.status(400).json({ error: "'prompt' must be a string" });
@@ -188,7 +223,9 @@ app.post("/chatgpt-analyze", async (req, res) => {
     for (const domain of domains) {
       try {
         const result = await analyzeUrl(`https://${domain}`);
-        await db.execute(
+
+        // Insert domain record
+        const [domainResult] = await db.execute(
           `INSERT INTO domains 
             (prompt_id, domain, score, trust_level, safe_browsing, domain_age, page_rank, reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -203,6 +240,31 @@ app.post("/chatgpt-analyze", async (req, res) => {
             result.reason.join(", "),
           ]
         );
+
+        const domainId = domainResult.insertId;
+
+        // Fetch LinkedIn contacts
+        const linkedInContacts = await fetchLinkedInContactsFromDomains(domain);
+
+        // Insert LinkedIn contacts (if any)
+        for (const contact of linkedInContacts) {
+          await db.execute(
+            `INSERT INTO linkedin_contacts 
+              (domain_id, linkedin_profile_url, name, job_title, guessed_emails, notes)
+              VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+              domainId,
+              contact.LinkedIn_Profile_URL,
+              contact.Name,
+              contact.Job_Title_Guessed,
+              JSON.stringify(contact.Guessed_Emails || []),
+              contact.Notes || "",
+            ]
+          );
+        }
+
+        // Append to result
+        result.linked_in = linkedInContacts;
         results.push(result);
       } catch (e) {
         results.push({
@@ -212,6 +274,7 @@ app.post("/chatgpt-analyze", async (req, res) => {
       }
     }
 
+    // Append to result
     res.json({ extracted_domains: domains, results });
   } catch (err) {
     console.error(err);
@@ -231,8 +294,18 @@ app.get("/prompts", async (req, res) => {
 
 app.get("/domains", async (req, res) => {
   try {
-    const [rows] = await db.execute("SELECT * FROM domains");
-    res.json(rows);
+    const [domains] = await db.execute("SELECT * FROM domains");
+
+    // Add has_linked_in field
+    for (const domain of domains) {
+      const [contacts] = await db.execute(
+        "SELECT COUNT(*) as count FROM linkedin_contacts WHERE domain_id = ?",
+        [domain.id]
+      );
+      domain.has_linked_in = contacts[0].count > 0;
+    }
+
+    res.json(domains);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch domains" });
@@ -249,15 +322,61 @@ app.get("/contacts", async (req, res) => {
   }
 });
 
-app.get("/prompts/:id", async (req, res) => {
+app.get("/prompt/:id", async (req, res) => {
   const promptId = req.params.id;
 
-  const [promptRows] = await db.execute("SELECT * FROM prompts WHERE id = ?", [promptId]);
-  if (!promptRows.length) return res.status(404).json({ error: "Prompt not found" });
+  const [promptRows] = await db.execute("SELECT * FROM prompts WHERE id = ?", [
+    promptId,
+  ]);
+  if (!promptRows.length)
+    return res.status(404).json({ error: "Prompt not found" });
 
-  const [domainRows] = await db.execute("SELECT * FROM domains WHERE prompt_id = ?", [promptId]);
+  const [domainRows] = await db.execute(
+    "SELECT * FROM domains WHERE prompt_id = ?",
+    [promptId]
+  );
 
   res.json({ prompt: promptRows[0], domains: domainRows });
+});
+
+app.get("/domain/:id", async (req, res) => {
+  const domainId = req.params.id;
+
+  try {
+    // Fetch the domain by ID
+    const [domains] = await db.execute("SELECT * FROM domains WHERE id = ?", [
+      domainId,
+    ]);
+    if (domains.length === 0) {
+      return res.status(404).json({ error: "Domain not found" });
+    }
+    const domain = domains[0];
+
+    // Fetch LinkedIn contacts for the domain
+    const [contacts] = await db.execute(
+      "SELECT * FROM linkedin_contacts WHERE domain_id = ?",
+      [domainId]
+    );
+
+    // Add contacts array to domain object
+    domain.linkedin_contacts = contacts;
+
+    res.json(domain);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch domain" });
+  }
+});
+
+app.post("/scrape-emails", async (req, res) => {
+  const { domains } = req.body;
+  const results = await crawlPageForEmails(domains);
+  res.json({ results });
+  try {
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to crawl websites" });
+  }
 });
 
 const PORT = process.env.PORT || 3000;

@@ -1,6 +1,7 @@
 import axios from "axios";
 import {URL} from 'url'
 import dotenv from 'dotenv';
+import { db } from "./db.js";
 dotenv.config();
 
 const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY;
@@ -124,7 +125,6 @@ async function getLinkedInProfiles(domain, roleKeywords, maxResults = 10) {
 export async function fetchLinkedInContactsFromDomains(rawDomain) {
 
 const domain = cleanDomain(rawDomain);
-  console.log(rawDomain)
   if (!domain) {
     return [{
       Domain: rawDomain,
@@ -136,10 +136,8 @@ const domain = cleanDomain(rawDomain);
     }];
   }
 
-
-  console.log(domain)
   const profiles = await getLinkedInProfiles(domain, JOB_TITLE_KEYWORDS, MAX_CONTACTS_PER_COMPANY * 2);
-  console.log(profiles)
+
   const seen = new Set();
   const results = [];
   
@@ -169,7 +167,25 @@ const domain = cleanDomain(rawDomain);
     }];
   }
 
-  console.log(results)
   return results;
 }
 
+
+export async function storeLinkedInContacts(domainId, contacts) {
+  const insertQuery = `
+    INSERT INTO linkedin_contacts 
+    (domain_id, linkedin_profile_url, name, job_title, guessed_emails, notes) 
+    VALUES (?, ?, ?, ?, ?, ?)
+  `;
+
+  for (const contact of contacts) {
+    await db.execute(insertQuery, [
+      domainId,
+      contact.LinkedIn_Profile_URL,
+      contact.Name,
+      contact.Job_Title_Guessed,
+      JSON.stringify(contact.Guessed_Emails),
+      contact.Notes || ''
+    ]);
+  }
+}
